@@ -54,7 +54,7 @@ def run_sync_logic():
 
     rows_to_insert = []
     for log in logs:
-        if log.get("sensorCode", "").startswith("TEST"):
+        if log.get("sensorCode", "").startswith("SENSOR-PROTOTYPE"):
             rows_to_insert.append((
                 log.get("id"), 
                 log.get("sensorCode"), 
