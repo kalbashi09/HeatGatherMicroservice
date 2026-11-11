@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+httpx
+pandas
+openpyxl
+psycopg2-binary
+apscheduler
