@@ -1,4 +1,5 @@
 import io
+import math
 from datetime import date
 import httpx
 import pandas as pd
@@ -40,7 +41,79 @@ def get_db():
     )
 
 # ==========================================
-# 3. CORE SYNC LOGIC
+# 3. NOAA FORMULA (TRANSLATED FROM C#)
+# ==========================================
+def calculate_heat_index(temp_celsius: float, humidity: float) -> float:
+    # LAYER 1: INPUT SAFETY CLAMPS
+    temp_celsius = max(10.0, min(temp_celsius, 45.0))
+    humidity = max(0.0, min(humidity, 100.0))
+
+    # Convert Celsius to Fahrenheit
+    T = (temp_celsius * 9.0 / 5.0) + 32.0
+    RH = humidity
+
+    # STEP 1: SIMPLIFIED STEADMAN FORMULA
+    HI_simple = 0.5 * (T + 61.0 + ((T - 68.0) * 1.2) + (RH * 0.094))
+
+    # STEP 2: AVERAGE WITH ACTUAL TEMPERATURE
+    HI = (HI_simple + T) / 2.0
+
+    # STEP 3: APPLY ROTHFUSZ ONLY IF INITIAL HI >= 80°F
+    if HI >= 80.0:
+        HI = -42.379 + \
+             (2.04901523 * T) + \
+             (10.14333127 * RH) - \
+             (0.22475541 * T * RH) - \
+             (0.00683783 * T * T) - \
+             (0.05481717 * RH * RH) + \
+             (0.00122874 * T * T * RH) + \
+             (0.00085282 * T * RH * RH) - \
+             (0.00000199 * T * T * RH * RH)
+
+        # LOW HUMIDITY ADJUSTMENT
+        if RH < 13.0 and 80.0 <= T <= 112.0:
+            adjustment = ((13.0 - RH) / 4.0) * math.sqrt((17.0 - abs(T - 95.0)) / 17.0)
+            HI -= adjustment
+        # HIGH HUMIDITY ADJUSTMENT
+        elif RH > 85.0 and 80.0 <= T <= 87.0:
+            adjustment = ((RH - 85.0) / 10.0) * ((87.0 - T) / 5.0)
+            HI += adjustment
+
+    # STEP 4: CONVERT BACK TO CELSIUS
+    heat_index_celsius = (HI - 32.0) * 5.0 / 9.0
+
+    # LAYER 2: APPLICATION-SPECIFIC OUTPUT SAFETY CLAMP
+    if heat_index_celsius > 70.0:
+        heat_index_celsius = 70.0
+
+    return heat_index_celsius
+
+# ==========================================
+# 4. REVERSE CALCULATION (BINARY SEARCH)
+# ==========================================
+def calculate_ambient_temp(heat_index_celsius: float, humidity: float) -> float:
+    """
+    Uses Binary Search to find the ambient temperature that produces the given Heat Index.
+    Because the formula clamps temp between 10 and 45, we search within that range.
+    """
+    low = 10.0
+    high = 45.0
+    
+    # 40 iterations is extremely precise (converges to fractions of a degree)
+    for _ in range(40):
+        mid = (low + high) / 2.0
+        calculated_hi = calculate_heat_index(mid, humidity)
+        
+        # If the calculated HI is lower than the target HI, we need a higher temp
+        if calculated_hi < heat_index_celsius:
+            low = mid
+        else:
+            high = mid
+            
+    return round((low + high) / 2.0, 1)
+
+# ==========================================
+# 5. CORE SYNC LOGIC
 # ==========================================
 def run_sync_logic():
     print("⏳ [Background] Fetching latest data from external API...")
@@ -86,11 +159,10 @@ def run_sync_logic():
         print(f"❌ [Background] Database error: {e}")
 
 # ==========================================
-# 4. STARTUP EVENT & SCHEDULER
+# 6. STARTUP EVENT & SCHEDULER
 # ==========================================
 @app.on_event("startup")
 def startup_event():
-    # 1. Create table if it doesn't exist
     print("Connecting to Supabase to check tables...")
     try:
         with get_db() as conn:
@@ -110,25 +182,20 @@ def startup_event():
     except Exception as e:
         print(f"❌ Failed to initialize database: {e}")
 
-    # 2. Start the internal background loop
     scheduler = BackgroundScheduler()
-    # Runs every 1 minute. (You can change this to minutes=5 if preferred)
     scheduler.add_job(run_sync_logic, 'interval', minutes=1)
     scheduler.start()
     print("🔄 Background auto-sync started! Running every 1 minute.")
 
 # ==========================================
-# 5. ENDPOINTS
+# 7. ENDPOINTS
 # ==========================================
-
 @app.get("/health")
 def health_check():
-    """Ping this endpoint via cron-job.org to keep Render awake."""
     return {"status": "awake"}
 
 @app.post("/sync")
 def manual_sync(x_sync_token: str = Header(...)):
-    """Optional: Allows you to manually trigger a sync if needed."""
     if x_sync_token != SYNC_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid sync token")
     
@@ -160,9 +227,24 @@ def export_excel(
     if df.empty:
         raise HTTPException(status_code=404, detail="No data found for the selected date range")
 
+    # --- NEW: REVERSE CALCULATION ---
+    # Apply the reverse math to every row and create a new column
+    df['calculated_ambient_c'] = df.apply(
+        lambda row: calculate_ambient_temp(row['heat_index'], row['humidity']), 
+        axis=1
+    )
+
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="All Data", index=False)
+        
+        # 1. Original Data Sheet
+        df_original = df.drop(columns=['calculated_ambient_c'])
+        df_original.to_excel(writer, sheet_name="Original Data", index=False)
+        
+        # 2. New Reversed Ambient Sheet
+        df.to_excel(writer, sheet_name="Reversed Ambient Temp", index=False)
+        
+        # 3. Per-sensor Sheets (includes the new reversed column)
         for sensor_code, group in df.groupby("sensor_code"):
             safe_sheet_name = str(sensor_code)[:31]
             group.to_excel(writer, sheet_name=safe_sheet_name, index=False)
